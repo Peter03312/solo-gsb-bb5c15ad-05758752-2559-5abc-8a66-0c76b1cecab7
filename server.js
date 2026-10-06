@@ -42,6 +42,15 @@
  *    历史操作、更正、证据封存与查询不受影响；失效时间变动递增台账版本，
  *    凭据另绑定已失效瓶集合指纹（瓶到达失效时间即使无写操作也使未提交凭据失效）；
  *    幂等判定先于失效拦截，已成功请求的幂等重试保持原结果。
+ *  - 样本处置：操作员凭 唯一处置号 + 瓶号 + 处置时间 + 正整数毫升数 + 原因 登记剩余样本处置；
+ *    处置作为纯扣量事件按（处置时间, 入库顺序）与全部操作一起重放（与操作共用同一入库
+ *    序号空间，同一时刻先入库者先核算），只扣减该瓶余量，不生成新瓶、不改动既有来源谱系；
+ *    已失效或受隔离影响的瓶仍可处置。处置时间不得早于瓶形成时间；若本次处置使后续任一
+ *    取用超量，整笔拒绝并返回冲突操作和瓶；有效预约锁定量不得被处置占用
+ *    （处置后该瓶余量须仍 ≥ 有效预约锁定量）。同号同内容重试幂等返回、不重复扣量，
+ *    异内容 409；单条操作、更正与批次提交的全账重放均计入处置扣量，历史更正使任一处置
+ *    或有效预约无法满足时整次回滚；处置提交递增台账版本，未使用的批次提交 / 更正确认
+ *    凭据随之失效。
  *  - better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
  *    并发请求争用同一来源瓶时天然保证体积守恒。
  */
@@ -132,6 +141,17 @@ CREATE TABLE IF NOT EXISTS reservation_sources (
   PRIMARY KEY (reservation_id, source_bottle)     -- 同一预约内来源瓶不得重复
 );
 CREATE INDEX IF NOT EXISTS idx_res_sources_bottle ON reservation_sources(source_bottle);
+CREATE TABLE IF NOT EXISTS disposals (
+  disposal_id   TEXT PRIMARY KEY,
+  bottle_id     TEXT NOT NULL REFERENCES bottles(id), -- 被处置的瓶（只扣减该瓶余量，不生成新瓶）
+  disposal_time TEXT NOT NULL,                        -- 处置时间（与操作时间同格式，不得早于瓶形成时间）
+  volume        INTEGER NOT NULL CHECK (volume > 0),  -- 处置体积（正整数 mL）
+  reason        TEXT NOT NULL,                        -- 处置原因（非空）
+  seq           INTEGER NOT NULL UNIQUE,              -- 入库顺序（与 operations 共用同一序号空间）
+  plan_hash     TEXT NOT NULL,                        -- 内容哈希（瓶+时间+体积+原因），幂等 / 冲突判定
+  created_at    TEXT NOT NULL                         -- 服务器登记时刻（ISO 字符串）
+);
+CREATE INDEX IF NOT EXISTS idx_disposals_bottle ON disposals(bottle_id);
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -212,7 +232,8 @@ const qInsBottle  = db.prepare('INSERT INTO bottles (id, kind, created_time, ini
 const qExpUpd     = db.prepare('UPDATE bottles SET expires_at = ? WHERE id = ?');
 const qOp         = db.prepare('SELECT * FROM operations WHERE op_id = ?');
 const qInsOp      = db.prepare('INSERT INTO operations (op_id, seq, target_bottle, op_time, reservation_id) VALUES (?, ?, ?, ?, ?)');
-const qNextSeq    = db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM operations');
+// 入库序号：操作与处置共用同一序号空间，保证按（时间, 入库顺序）重放时两类事件可稳定交错排序
+const qNextSeq    = db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM (SELECT seq FROM operations UNION ALL SELECT seq FROM disposals)');
 const qOpSources  = db.prepare('SELECT source_bottle, volume FROM operation_sources WHERE op_id = ? ORDER BY source_bottle');
 const qInsSource  = db.prepare('INSERT INTO operation_sources (op_id, source_bottle, volume) VALUES (?, ?, ?)');
 const qDelSources = db.prepare('DELETE FROM operation_sources WHERE op_id = ?');
@@ -252,6 +273,12 @@ const qResActiveOnBottle = db.prepare(`
   JOIN reservation_sources rs ON rs.reservation_id = r.reservation_id
   WHERE rs.source_bottle = ? AND r.status = 'active' AND r.expires_at > ?
   ORDER BY r.expires_at, r.reservation_id`);
+const qDispGet       = db.prepare('SELECT * FROM disposals WHERE disposal_id = ?');
+const qDispAll       = db.prepare('SELECT * FROM disposals ORDER BY disposal_time, seq');
+const qDispByBottle  = db.prepare('SELECT * FROM disposals WHERE bottle_id = ? ORDER BY disposal_time, seq');
+const qDispIns       = db.prepare('INSERT INTO disposals (disposal_id, bottle_id, disposal_time, volume, reason, seq, plan_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+// 各瓶已处置合计（mL）
+const qDisposedByBottle = db.prepare('SELECT bottle_id AS bottle, SUM(volume) AS disposed FROM disposals GROUP BY bottle_id');
 
 /**
  * 台账版本号：任何写操作（登记原瓶 / 单条操作 / 更正 / 批次提交）成功提交后递增。
@@ -261,7 +288,7 @@ function ledgerVersion() { return parseInt(qVersion.get().value, 10); }
 
 // ------------------------------------------------------- 台账重放（守恒校验）
 
-/** 从数据库加载全量台账：瓶 + 按 (操作时间, 入库顺序) 排序的操作及其来源。 */
+/** 从数据库加载全量台账：瓶 + 按 (操作时间, 入库顺序) 排序的操作及其来源 + 处置事件。 */
 function loadLedger() {
   const bottles = db.prepare('SELECT id, kind, initial_volume, created_time FROM bottles').all();
   const ops = db.prepare('SELECT op_id, seq, target_bottle, op_time FROM operations ORDER BY op_time, seq').all();
@@ -271,44 +298,67 @@ function loadLedger() {
     if (!byOp.has(s.op_id)) byOp.set(s.op_id, []);
     byOp.get(s.op_id).push({ bottle: s.source_bottle, volume: s.volume });
   }
-  return { bottles, ops: ops.map((o) => ({ ...o, sources: byOp.get(o.op_id) || [] })) };
+  const disposals = db.prepare('SELECT disposal_id, bottle_id, disposal_time, volume, reason, seq, created_at FROM disposals ORDER BY disposal_time, seq').all();
+  return { bottles, ops: ops.map((o) => ({ ...o, sources: byOp.get(o.op_id) || [] })), disposals };
 }
 
 /** 操作排序：先按操作时间，同一时间按入库顺序（批内即录入顺序）。 */
 const cmpOps = (a, b) => (a.op_time < b.op_time ? -1 : a.op_time > b.op_time ? 1 : a.seq - b.seq);
 
 /**
- * 按 (操作时间, 入库顺序) 重放操作序列，计算每个瓶的余量。
- * 任一取用使余量为负即记录冲突；冲突瓶按 0 继续推演，以便后续冲突的
- * “可用量”仍然可读。返回 { balances, conflicts }。
+ * 按 (时间, 入库顺序) 重放操作与处置事件序列，计算每个瓶的余量。
+ * 操作与处置共用同一入库序号空间，合并为同一时间线：操作从来源瓶扣量并生成目标瓶，
+ * 处置只从对应瓶扣量（不生成新瓶、不改动来源谱系）。
+ * 任一取用 / 处置使余量为负即记录冲突；冲突瓶按 0 继续推演，以便后续冲突的
+ * “可用量”仍然可读。返回 { balances, conflicts, disposalConflicts, disposalAfter }，
+ * 其中 disposalAfter 为 处置号 -> 该处置生效后其瓶的余量（处置流水展示用）。
  */
-function replayLedger(bottleRows, ops) {
+function replayLedger(bottleRows, ops, disposals = []) {
   const balances = new Map();
   for (const b of bottleRows) {
     if (b.kind === 'original') balances.set(b.id, b.initial_volume);
   }
+  const events = [];
+  for (const o of ops) events.push({ kind: 'op', time: o.op_time, seq: o.seq, op: o });
+  for (const d of disposals) events.push({ kind: 'disposal', time: d.disposal_time, seq: d.seq, d });
+  events.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : a.seq - b.seq));
   const conflicts = [];
-  for (const op of ops) {
-    let total = 0;
-    for (const s of op.sources) {
-      const avail = balances.get(s.bottle) || 0;
-      if (s.volume > avail) {
-        conflicts.push({ op_id: op.op_id, bottle: s.bottle, requested: s.volume, available: avail });
-        balances.set(s.bottle, 0);
-      } else {
-        balances.set(s.bottle, avail - s.volume);
+  const disposalConflicts = [];
+  const disposalAfter = new Map();
+  for (const ev of events) {
+    if (ev.kind === 'op') {
+      const op = ev.op;
+      let total = 0;
+      for (const s of op.sources) {
+        const avail = balances.get(s.bottle) || 0;
+        if (s.volume > avail) {
+          conflicts.push({ op_id: op.op_id, bottle: s.bottle, requested: s.volume, available: avail });
+          balances.set(s.bottle, 0);
+        } else {
+          balances.set(s.bottle, avail - s.volume);
+        }
+        total += s.volume;
       }
-      total += s.volume;
+      balances.set(op.target_bottle, (balances.get(op.target_bottle) || 0) + total);
+    } else {
+      const d = ev.d;
+      const avail = balances.get(d.bottle_id) || 0;
+      if (d.volume > avail) {
+        disposalConflicts.push({ disposal_id: d.disposal_id, bottle: d.bottle_id, requested: d.volume, available: avail });
+        balances.set(d.bottle_id, 0);
+      } else {
+        balances.set(d.bottle_id, avail - d.volume);
+      }
+      disposalAfter.set(d.disposal_id, balances.get(d.bottle_id));
     }
-    balances.set(op.target_bottle, (balances.get(op.target_bottle) || 0) + total);
   }
-  return { balances, conflicts };
+  return { balances, conflicts, disposalConflicts, disposalAfter };
 }
 
-/** 重放当前数据库中的全量台账。 */
+/** 重放当前数据库中的全量台账（含处置事件）。 */
 function recompute() {
-  const { bottles, ops } = loadLedger();
-  return replayLedger(bottles, ops);
+  const { bottles, ops, disposals } = loadLedger();
+  return replayLedger(bottles, ops, disposals);
 }
 
 // ---------------------------------------------------------------- 原瓶隔离（质检）
@@ -617,9 +667,10 @@ const createOperation = db.transaction((p) => {
   for (const s of p.sources) qInsSource.run(p.op_id, s.bottle, s.volume);
   if (reservation) fulfillReservation(p.reservation_id, p.op_id); // 与取用原子核销；失败整体回滚不核销
 
-  const { conflicts } = recompute();
-  if (conflicts.length) {
-    throw new ApiError(409, 'OVERDRAW', '取用量超过来源瓶可用余量，操作已拒绝，数据未变更', conflicts);
+  const { conflicts, disposalConflicts } = recompute();
+  if (conflicts.length || disposalConflicts.length) {
+    throw new ApiError(409, 'OVERDRAW', '取用量超过来源瓶可用余量或使既有处置无法满足，操作已拒绝，数据未变更',
+      [...conflicts, ...disposalConflicts]);
   }
   qBumpVersion.run();
   return { ok: true, idempotent: false,
@@ -643,10 +694,11 @@ const correctOperation = db.transaction((opId, sources) => {
   qDelSources.run(opId);
   for (const s of sources) qInsSource.run(opId, s.bottle, s.volume);
 
-  const { conflicts } = recompute();
-  if (conflicts.length) {
+  const { conflicts, disposalConflicts } = recompute();
+  if (conflicts.length || disposalConflicts.length) {
     throw new ApiError(409, 'CORRECTION_REJECTED',
-      '更正将导致以下操作超用，整次更正已拒绝，原数据保持不变', conflicts);
+      '更正将导致以下操作超用或既有处置无法满足，整次更正已拒绝，原数据保持不变',
+      [...conflicts, ...disposalConflicts]);
   }
   const excess = reservationExcess();
   if (excess.length) {
@@ -816,6 +868,81 @@ const cancelReservation = db.transaction((id) => {
   qResCancel.run(nowIso, nowIso, id);
   return { ok: true, idempotent: false, reservation: reservationJson(qResGet.get(id)),
            message: `预约 ${id} 已取消，锁定用量已释放回可预约量；该编号不可复用` };
+});
+
+// ---------------------------------------------------------------- 样本处置业务事务
+
+/** 处置内容哈希：绑定瓶号、处置时间、体积与原因，用于同号幂等 / 异内容冲突判定。 */
+function disposalPlanHash(p) {
+  const canonical = JSON.stringify({
+    bottle: p.bottle, disposal_time: p.disposal_time, volume: p.volume, reason: p.reason,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/** 处置记录行 → API JSON；disposalAfter（重放得到的 处置号 -> 处置后余量）存在时附 remaining_after。 */
+function disposalJson(row, disposalAfter) {
+  const j = {
+    disposal_id: row.disposal_id,
+    bottle: row.bottle_id,
+    disposal_time: row.disposal_time,
+    volume: row.volume,
+    reason: row.reason,
+    created_at: row.created_at,
+  };
+  if (disposalAfter) j.remaining_after = disposalAfter.get(row.disposal_id) ?? null;
+  return j;
+}
+
+/**
+ * 登记样本处置（事务）：只扣减该瓶余量，不生成新瓶、不改动既有来源谱系；
+ * 已失效或受隔离影响的瓶仍可处置（不做隔离 / 失效拦截）。
+ * 同号同内容（瓶 + 处置时间 + 体积 + 原因）重试 → 幂等返回，不重复扣量；异内容 → 409。
+ * 校验：瓶已存在；处置时间不得早于瓶形成时间；处置作为扣量事件按（处置时间, 入库顺序）
+ * 与全部操作一起重放，若使后续任一取用超量（或自身在时间线上无法满足）整笔拒绝并返回
+ * 冲突操作和瓶；有效预约锁定量不得被处置占用（处置后该瓶余量须仍 ≥ 有效预约锁定量）。
+ * 成功提交后台账版本递增，未使用的批次提交凭据与更正确认凭据随之失效。
+ */
+const createDisposal = db.transaction((p) => {
+  const planHash = disposalPlanHash(p);
+  const existing = qDispGet.get(p.disposal_id);
+  if (existing) {
+    if (existing.plan_hash === planHash) {
+      const { disposalAfter } = recompute();
+      return { ok: true, idempotent: true, disposal: disposalJson(existing, disposalAfter),
+               message: `处置号 ${p.disposal_id} 已登记过相同内容，幂等返回，未重复扣量` };
+    }
+    throw new ApiError(409, 'DISPOSAL_CONFLICT', `处置号 ${p.disposal_id} 已存在且内容不一致，请更换处置号`);
+  }
+  const b = qBottle.get(p.bottle);
+  if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${p.bottle} 不存在`);
+  if (p.disposal_time < b.created_time) {
+    throw new ApiError(400, 'TIME_BEFORE_FORMATION',
+      `处置时间 ${p.disposal_time} 早于瓶 ${p.bottle} 的形成时间 ${b.created_time}`);
+  }
+  qDispIns.run(p.disposal_id, p.bottle, p.disposal_time, p.volume, p.reason,
+    qNextSeq.get().next, planHash, new Date().toISOString());
+  // 按（时间, 入库顺序）重放全账：本次处置若使后续任一取用超量，整笔拒绝并返回冲突操作和瓶
+  const replay = recompute();
+  if (replay.conflicts.length || replay.disposalConflicts.length) {
+    throw new ApiError(409, 'DISPOSAL_OVERDRAW',
+      '本次处置使后续任一取用超量或自身在处置时刻可用量不足，整笔处置已拒绝，数据未变更',
+      [...replay.conflicts, ...replay.disposalConflicts]);
+  }
+  // 有效预约锁定量不得被处置占用：处置后该瓶余量须仍 ≥ 有效预约锁定量
+  const remaining = replay.balances.get(p.bottle) ?? 0;
+  const locked = activeReservedByBottle(nowLocal()).get(p.bottle) ?? 0;
+  if (remaining < locked) {
+    const beforeRem = remaining + p.volume; // 重放无冲突，处置前余量 = 处置后余量 + 本次处置量
+    throw new ApiError(409, 'DISPOSAL_EXCEEDS_UNLOCKED',
+      `处置不得占用有效预约锁定量：瓶 ${p.bottle} 当前余量 ${beforeRem} mL、有效预约锁定 ${locked} mL、可处置 ${beforeRem - locked} mL，本次申请处置 ${p.volume} mL`,
+      [{ bottle: p.bottle, requested: p.volume, unlocked: beforeRem - locked, remaining: beforeRem, reserved: locked }]);
+  }
+  qBumpVersion.run();
+  return { ok: true, idempotent: false,
+           disposal: disposalJson(qDispGet.get(p.disposal_id), replay.disposalAfter),
+           remaining,
+           message: `处置 ${p.disposal_id} 已登记：瓶 ${p.bottle} 处置 ${p.volume} mL（${p.reason}），当前余量 ${remaining} mL；未使用的批次预演与更正确认凭据已失效` };
 });
 
 // ---------------------------------------------------------------- 批次（预演 / 提交）
@@ -1006,14 +1133,18 @@ function validateBatchItems(items) {
 }
 
 /**
- * 模拟重放：把批次条目作为虚拟操作（虚拟入库顺序 = 当前最大 seq 之后按录入顺序
- * 连续分配，与提交时的真实行为一致）追加到当前台账末尾，按 (操作时间, 入库顺序)
- * 全量重放。excludeIdx 中的条目（格式非法、无法模拟）不参与。
- * 返回 { conflicts, projected }，projected 为受影响瓶（批内来源 ∪ 目标）的预计余量。
+ * 模拟重放：把批次条目作为虚拟操作（虚拟入库顺序 = 当前最大 seq（含处置事件）之后按录入
+ * 顺序连续分配，与提交时的真实行为一致）追加到当前台账末尾，连同已登记处置一起按
+ * (时间, 入库顺序) 全量重放。excludeIdx 中的条目（格式非法、无法模拟）不参与。
+ * 返回 { conflicts, disposalConflicts, projected }，projected 为受影响瓶（批内来源 ∪ 目标）
+ * 的预计余量；disposalConflicts 为批次取用导致无法满足的既有处置。
  */
 function simulateBatch(items, excludeIdx) {
   const ledger = loadLedger();
-  const baseSeq = ledger.ops.reduce((m, o) => Math.max(m, o.seq), 0);
+  const baseSeq = Math.max(
+    ledger.ops.reduce((m, o) => Math.max(m, o.seq), 0),
+    ledger.disposals.reduce((m, d) => Math.max(m, d.seq), 0),
+  );
   const vBottles = [];
   const vOps = [];
   items.forEach((it, i) => {
@@ -1025,7 +1156,7 @@ function simulateBatch(items, excludeIdx) {
     });
   });
   const allOps = [...ledger.ops, ...vOps].sort(cmpOps);
-  const { balances, conflicts } = replayLedger([...ledger.bottles, ...vBottles], allOps);
+  const { balances, conflicts, disposalConflicts } = replayLedger([...ledger.bottles, ...vBottles], allOps, ledger.disposals);
   const affected = new Set();
   items.forEach((it, i) => {
     if (excludeIdx.has(i)) return;
@@ -1037,7 +1168,7 @@ function simulateBatch(items, excludeIdx) {
     in_batch: vBottles.some((b) => b.id === id),
     remaining: balances.get(id) ?? 0,
   }));
-  return { conflicts, projected };
+  return { conflicts, disposalConflicts, projected };
 }
 
 /** 批次计划的规范化内容哈希：绑定批次号与全部条目（含各自预约号），用于凭据与幂等判定。 */
@@ -1120,11 +1251,14 @@ const commitBatch = db.transaction((batchId, items, planHash, token) => {
     qInsBatchItem.run(batchId, i, it.op_id);
     if (it.reservation_id) fulfillReservation(it.reservation_id, it.op_id); // 与取用原子核销；失败整批回滚不核销
   });
-  const { balances, conflicts } = recompute();
-  if (conflicts.length) {
+  const { balances, conflicts, disposalConflicts } = recompute();
+  if (conflicts.length || disposalConflicts.length) {
     const opToIdx = new Map(items.map((it, i) => [it.op_id, i]));
-    throw new ApiError(409, 'OVERDRAW', '批次重放全账后出现超用，整批已回滚，数据未变更',
-      conflicts.map((c) => ({ index: opToIdx.has(c.op_id) ? opToIdx.get(c.op_id) : null, ...c })));
+    throw new ApiError(409, 'OVERDRAW', '批次重放全账后出现超用或使既有处置无法满足，整批已回滚，数据未变更',
+      [
+        ...conflicts.map((c) => ({ index: opToIdx.has(c.op_id) ? opToIdx.get(c.op_id) : null, ...c })),
+        ...disposalConflicts.map((c) => ({ index: null, ...c })),
+      ]);
   }
   qBumpVersion.run();
   const affected = new Set();
@@ -1376,19 +1510,22 @@ function contributionSignature(rep) {
 
 /**
  * 预演更正（不写库）：把操作 opId 的来源替换为 newSources 后，
- *  - 按 (操作时间, 入库顺序) 重放全账，给出余量发生变化的瓶（before/after）与超用冲突；
+ *  - 连同已登记处置一起按 (时间, 入库顺序) 重放全账，给出余量发生变化的瓶（before/after）、
+ *    超用冲突与因此无法满足的既有处置（历史更正若使处置无法满足，确认时整体回滚）；
  *  - 在更正前后的形成图上，给出目标瓶及其下游瓶原瓶精确贡献的前后对照（无变化不列出）。
- * 调用方须先完成来源存在性与时间先后校验。返回 { conflicts, balance_changes, contribution_changes }。
+ * 调用方须先完成来源存在性与时间先后校验。
+ * 返回 { conflicts, disposal_conflicts, balance_changes, contribution_changes }。
  */
 function simulateCorrection(opId, newSources) {
-  const { bottles, ops } = loadLedger();
-  const before = replayLedger(bottles, ops).balances;
+  const { bottles, ops, disposals } = loadLedger();
+  const before = replayLedger(bottles, ops, disposals).balances;
   const afterOps = ops.map((o) => (o.op_id === opId
     ? { ...o, sources: newSources.map((s) => ({ bottle: s.bottle, volume: s.volume })) }
     : o));
-  const afterReplay = replayLedger(bottles, afterOps);
-  if (afterReplay.conflicts.length) {
-    return { conflicts: afterReplay.conflicts, balance_changes: [], contribution_changes: [], balances_after: afterReplay.balances };
+  const afterReplay = replayLedger(bottles, afterOps, disposals);
+  if (afterReplay.conflicts.length || afterReplay.disposalConflicts.length) {
+    return { conflicts: afterReplay.conflicts, disposal_conflicts: afterReplay.disposalConflicts,
+             balance_changes: [], contribution_changes: [], balances_after: afterReplay.balances };
   }
   const balanceChanges = [];
   for (const [id, b] of before) {
@@ -1420,7 +1557,7 @@ function simulateCorrection(opId, newSources) {
       });
     }
   }
-  return { conflicts: [], balance_changes: balanceChanges, contribution_changes: contributionChanges, balances_after: afterReplay.balances };
+  return { conflicts: [], disposal_conflicts: [], balance_changes: balanceChanges, contribution_changes: contributionChanges, balances_after: afterReplay.balances };
 }
 
 /**
@@ -1453,9 +1590,10 @@ const confirmCorrection = db.transaction((opId, sources, token) => {
   const diff = simulateCorrection(opId, sources); // 落库前计算，与预演结果一致
   qDelSources.run(opId);
   for (const s of sources) qInsSource.run(opId, s.bottle, s.volume);
-  const { conflicts } = recompute();
-  if (conflicts.length) {
-    throw new ApiError(409, 'OVERDRAW', '更正将导致以下操作超用，整次更正已拒绝，原数据保持不变', conflicts);
+  const { conflicts, disposalConflicts } = recompute();
+  if (conflicts.length || disposalConflicts.length) {
+    throw new ApiError(409, 'OVERDRAW', '更正将导致以下操作超用或既有处置无法满足，整次更正已拒绝，原数据保持不变',
+      [...conflicts, ...disposalConflicts]);
   }
   const excess = reservationExcess();
   if (excess.length) {
@@ -1770,6 +1908,7 @@ app.post('/api/operations/:opId/corrections/preview', wrap((req, res) => {
   const opId = req.params.opId;
   const errors = [];
   let conflicts = [];
+  let disposalConflicts = [];
   const op = qOp.get(opId);
   if (!op) errors.push({ code: 'OP_NOT_FOUND', message: `操作 ${opId} 不存在` });
   const sources = [];
@@ -1806,6 +1945,11 @@ app.post('/api/operations/:opId/corrections/preview', wrap((req, res) => {
         errors.push({ code: 'OVERDRAW',
           message: `更正将导致操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，该时刻可用仅 ${c.available} mL` });
       }
+      disposalConflicts = sim.disposal_conflicts || [];
+      for (const c of disposalConflicts) {
+        errors.push({ code: 'DISPOSAL_OVERDRAW',
+          message: `更正将使处置 ${c.disposal_id} 无法满足：瓶 ${c.bottle} 在该处置时刻可用仅 ${c.available} mL，需处置 ${c.requested} mL` });
+      }
       if (errors.length === 0) {
         // 更正不得使任一瓶的有效预约锁定量超过更正后余量，否则整体拒绝
         const reserved = activeReservedByBottle(nowLocal());
@@ -1832,6 +1976,7 @@ app.post('/api/operations/:opId/corrections/preview', wrap((req, res) => {
     ledger_version: version,
     errors,
     conflicts,
+    disposal_conflicts: disposalConflicts,
     reservation_excess: resExcess,
     balance_changes: diff.balance_changes,
     contribution_changes: diff.contribution_changes,
@@ -1859,6 +2004,7 @@ app.get('/api/bottles', wrap((req, res) => {
   const now = nowLocal();
   const reserved = activeReservedByBottle(now);
   const expMap = expiryMap();
+  const disposedMap = new Map(qDisposedByBottle.all().map((r) => [r.bottle, r.disposed]));
   const rows = db.prepare('SELECT * FROM bottles ORDER BY created_time, id').all()
     .map((b) => {
       const remaining = balances.get(b.id) ?? 0;
@@ -1868,7 +2014,8 @@ app.get('/api/bottles', wrap((req, res) => {
         ...b,
         remaining,
         reserved: locked,              // 有效预约锁定量（未到期、未取消、未核销）
-        reservable: remaining - locked, // 可预约量 = 当前余量 − 全部有效预约
+        reservable: remaining - locked, // 可预约量 = 当前余量 − 全部有效预约（同为可处置量）
+        disposed: disposedMap.get(b.id) ?? 0, // 已处置合计（mL）
         expires_at: exp,                // 失效时间（未设置为 null）
         expired: exp !== null && exp <= now, // 当前时间到达失效时间即已失效
         quarantine: quarMap.has(b.id)
@@ -1884,18 +2031,21 @@ app.get('/api/bottles', wrap((req, res) => {
 app.get('/api/bottles/:id', wrap((req, res) => {
   const b = qBottle.get(req.params.id);
   if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${req.params.id} 不存在`);
-  const { balances } = recompute();
+  const { balances, disposalAfter } = recompute();
   const impact = quarantineImpactMap();
   const quar = qQuarGet.get(b.id);
   const now = nowLocal();
   const remaining = balances.get(b.id) ?? 0;
   const locked = activeReservedByBottle(now).get(b.id) ?? 0;
   const exp = expiryMap().get(b.id) ?? null; // 有效失效时间（衍生瓶按来源链继承最早者）
+  const disposals = qDispByBottle.all(b.id).map((r) => disposalJson(r, disposalAfter));
   res.json({
     ...b,
     remaining,
     reserved: locked,
     reservable: remaining - locked,
+    disposed: disposals.reduce((a, d) => a + d.volume, 0), // 已处置合计（mL）
+    disposals,                              // 该瓶处置流水（含每笔处置后余量）
     expires_at: exp,
     expired: exp !== null && exp <= now,
     active_reservations: qResActiveOnBottle.all(b.id, now), // 当前有效预约（锁定该瓶的预约号、到期时间、锁定量）
@@ -2031,6 +2181,46 @@ app.post('/api/reservations/:id/cancel', wrap((req, res) => {
   res.json(cancelReservation(normId(req.params.id, '预约号')));
 }));
 
+// ---------------------------------------------------------------- 样本处置 HTTP 接口
+
+/**
+ * 登记处置：{disposal_id, bottle, disposal_time, volume, reason}。
+ * 只扣减该瓶余量，不生成新瓶、不改动既有来源谱系；已失效或受隔离影响的瓶仍可处置。
+ * 同号同内容重试 → 200 幂等返回、不重复扣量；异内容 → 409 DISPOSAL_CONFLICT；
+ * 瓶不存在 → 404；处置时间早于瓶形成时间 → 400 TIME_BEFORE_FORMATION；
+ * 使后续任一取用超量 → 409 DISPOSAL_OVERDRAW（details 给出冲突操作 / 处置与瓶）；
+ * 占用有效预约锁定量 → 409 DISPOSAL_EXCEEDS_UNLOCKED。成功 → 201，台账版本递增，
+ * 未使用的批次提交凭据与更正确认凭据随之失效。
+ */
+app.post('/api/disposals', wrap((req, res) => {
+  const p = {
+    disposal_id: normId(req.body && req.body.disposal_id, '处置号'),
+    bottle: normId(req.body && req.body.bottle, '瓶编号'),
+    disposal_time: normTime(req.body && req.body.disposal_time, '处置时间'),
+    volume: normVolume(req.body && req.body.volume, '处置体积'),
+    reason: normId(req.body && req.body.reason, '处置原因'),
+  };
+  const result = createDisposal(p);
+  res.status(result.idempotent ? 200 : 201).json(result);
+}));
+
+/** 处置流水（按 处置时间 + 入库顺序 排列，含每笔处置后该瓶余量 remaining_after）。可按 ?bottle= 过滤。 */
+app.get('/api/disposals', wrap((req, res) => {
+  const bottle = req.query.bottle ? String(req.query.bottle).trim() : null;
+  const { disposalAfter } = recompute();
+  let rows = qDispAll.all();
+  if (bottle) rows = rows.filter((r) => r.bottle_id === bottle);
+  res.json(rows.map((r) => disposalJson(r, disposalAfter)));
+}));
+
+/** 单笔处置详情（含处置后余量）；不存在 → 404 DISPOSAL_NOT_FOUND。 */
+app.get('/api/disposals/:id', wrap((req, res) => {
+  const row = qDispGet.get(req.params.id);
+  if (!row) throw new ApiError(404, 'DISPOSAL_NOT_FOUND', `处置号 ${req.params.id} 不存在`);
+  const { disposalAfter } = recompute();
+  res.json(disposalJson(row, disposalAfter));
+}));
+
 app.get('/api/operations', wrap((req, res) => {
   const ops = db.prepare(`
     SELECT o.*, bi.batch_id AS batch_id FROM operations o
@@ -2150,6 +2340,11 @@ app.post('/api/batches/preview', wrap((req, res) => {
       topErrors.push({ code: 'LEDGER_CONFLICT', message: `现有台账操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，可用仅 ${c.available} mL` });
     }
   }
+  // 批次取用导致既有处置无法满足：作为整批错误反馈（不签发提交凭据，提交时重跑校验整批回滚）
+  for (const c of sim.disposalConflicts || []) {
+    topErrors.push({ code: 'DISPOSAL_OVERDRAW',
+      message: `批次取用将使已登记处置 ${c.disposal_id} 无法满足：瓶 ${c.bottle} 在该处置时刻可用仅 ${c.available} mL，需处置 ${c.requested} mL` });
+  }
   const itemResults = items.map((it, i) => ({
     index: i, op_id: it.op_id, ok: !itemErrors.has(i), errors: itemErrors.get(i) || [],
   }));
@@ -2256,9 +2451,13 @@ function seed() {
     qInsBottle.run('ALQ-001', 'derived', '2026-10-02T09:00:00', 0, 'OP-0002', null);
     qInsSource.run('OP-0002', 'MIX-001', 100);
 
+    const seedDisp = { bottle: 'W2026-003', disposal_time: '2026-10-03T09:00:00', volume: 50, reason: '留样期满，按规定处置' };
+    qDispIns.run('DISP-0001', seedDisp.bottle, seedDisp.disposal_time, seedDisp.volume, seedDisp.reason,
+      qNextSeq.get().next, disposalPlanHash(seedDisp), new Date().toISOString());
+
     qBumpVersion.run();
   })();
-  console.log('[init] 数据库为空，已写入示例数据（3 个原始瓶 + 2 条操作）');
+  console.log('[init] 数据库为空，已写入示例数据（3 个原始瓶 + 2 条操作 + 1 笔处置）');
 }
 
 seed();

@@ -63,7 +63,7 @@ h4{margin:14px 0 6px;font-size:14px}
 <body>
 <header>
   <h1>水质实验室 · 样本分装与混样溯源工作台</h1>
-  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围 / 证据封存与复核比较 / 预约锁定与核销 / 样本有效期管理</p>
+  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围 / 证据封存与复核比较 / 预约锁定与核销 / 样本有效期管理 / 样本处置</p>
 </header>
 <nav>
   <button data-tab="bottles" class="active">瓶子总览</button>
@@ -71,6 +71,7 @@ h4{margin:14px 0 6px;font-size:14px}
   <button data-tab="operation">新建分装 / 混样</button>
   <button data-tab="batch">批量预演 / 提交</button>
   <button data-tab="reservations">预约管理</button>
+  <button data-tab="disposals">样本处置</button>
   <button data-tab="ops">操作记录与更正</button>
   <button data-tab="quarantine">质检隔离</button>
   <button data-tab="seals">证据封存</button>
@@ -182,6 +183,38 @@ h4{margin:14px 0 6px;font-size:14px}
       <tbody></tbody>
     </table>
     <p class="hint">仅“有效”预约可取消、可兑现；已到期与已取消的预约不可兑现；已核销记录核销它的操作号。</p>
+  </div>
+</section>
+
+<!-- ============ 样本处置 ============ -->
+<section id="tab-disposals" style="display:none">
+  <div class="card">
+    <h3>登记处置（剩余样本处置：只扣减该瓶余量，不生成新瓶、不改动来源谱系）</h3>
+    <div class="grid2">
+      <div><label>处置号（唯一，重复提交相同内容将幂等返回）</label><input id="dsp_id" type="text" placeholder="如 DISP-0002"></div>
+      <div><label>瓶编号（已失效或受隔离影响的瓶仍可处置）</label><input id="dsp_bottle" type="text" list="bottleList" placeholder="如 W2026-003"></div>
+      <div><label>处置时间（不得早于瓶形成时间）</label><input id="dsp_time" type="datetime-local" step="60"></div>
+      <div><label>处置体积（mL，正整数）</label><input id="dsp_vol" type="number" min="1" step="1" placeholder="如 50"></div>
+      <div><label>处置原因（必填，非空）</label><input id="dsp_reason" type="text" placeholder="如 留样期满，按规定处置"></div>
+    </div>
+    <p><button class="btn" id="dspSubmit">登记处置</button></p>
+    <p class="hint">处置按（处置时间, 入库顺序）与既有操作一起重放：若本次处置使后续任一取用超量，整笔拒绝并返回冲突操作和瓶；
+      有效预约锁定量不得被处置占用（可处置量 = 当前余量 − 有效预约锁定）；处置提交后，未使用的批次预演与更正确认凭据失效（需重新预演）。</p>
+  </div>
+  <div class="card">
+    <h3>处置流水（按处置时间排列，含处置后余量）</h3>
+    <table id="dspTable">
+      <thead><tr><th>处置号</th><th>瓶编号</th><th>处置时间</th><th class="num">处置体积 (mL)</th><th>原因</th><th class="num">处置后余量 (mL)</th><th>登记时间</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h3>可用余量（可处置量 = 当前余量 − 有效预约锁定）</h3>
+    <table id="dspBalanceTable">
+      <thead><tr><th>瓶编号</th><th>类型</th><th class="num">当前余量 (mL)</th><th class="num">预约锁定 (mL)</th><th class="num">可处置量 (mL)</th><th class="num">已处置合计 (mL)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="hint">已失效或受隔离影响的瓶仍可登记处置；处置不影响来源谱系、原瓶贡献与隔离影响范围。</p>
   </div>
 </section>
 
@@ -299,6 +332,9 @@ function showMsg(type, text, details) {
           (c.reservable !== undefined ? `可预约量仅 ${c.reservable} mL` : `余量仅 ${c.remaining} mL`);
         return `瓶 ${c.bottle}：${need}${cap}（当前余量 ${c.remaining} mL，有效预约锁定 ${c.reserved} mL）`;
       }
+      if (c && c.disposal_id) {
+        return `处置 ${c.disposal_id} 在瓶 ${c.bottle} 需处置 ${c.requested} mL，该时刻可用仅 ${c.available} mL`;
+      }
       const where = (c.index !== undefined && c.index !== null) ? `第 ${c.index + 1} 条 ` : '';
       return `${where}操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，可用仅 ${c.available} mL`;
     }).join('\n');
@@ -334,6 +370,7 @@ document.querySelectorAll('nav button').forEach(btn => {
     if (btn.dataset.tab === 'quarantine') loadQuarantine();
     if (btn.dataset.tab === 'seals') loadSeals();
     if (btn.dataset.tab === 'reservations') loadReservations();
+    if (btn.dataset.tab === 'disposals') loadDisposals();
   });
 });
 
@@ -425,11 +462,11 @@ async function showBottle(id) {
       <p>类型：<span class="tag ${b.kind}">${b.kind === 'original' ? '原始瓶' : '衍生瓶'}</span>
       创建/采样时间：${escapeHtml(b.created_time)}
       ${b.kind === 'original' ? '初始体积：' + b.initial_volume + ' mL　' : ''}
-      <b>当前余量：${b.remaining} mL</b>　预约锁定：${b.reserved} mL　<b>可预约：${b.reservable} mL</b></p>`;
+      <b>当前余量：${b.remaining} mL</b>　预约锁定：${b.reserved} mL　<b>可预约：${b.reservable} mL</b>　已处置合计：${b.disposed} mL</p>`;
     html += `<p>失效时间：${b.expires_at ? `<span class="mono">${escapeHtml(b.expires_at)}</span>` : '未设置'} ${expTagHtml(b)}` +
       (b.kind === 'derived' ? '<span class="hint">（衍生瓶按全部来源瓶中最早的有效失效时间自动继承，随历史更正重算）</span>' : '') + '</p>';
     if (b.expired) {
-      html += '<p class="low">该瓶已失效：不得用于新分装 / 混样、预约登记或预约核销（历史操作、更正、证据封存与查询不受影响）。</p>';
+      html += '<p class="low">该瓶已失效：不得用于新分装 / 混样、预约登记或预约核销（历史操作、更正、证据封存与查询不受影响；该瓶仍可登记处置）。</p>';
     }
     if (b.kind === 'original') {
       html += `<h4>失效时间管理（仅原瓶可设置 / 修改 / 清除）</h4>
@@ -448,7 +485,7 @@ async function showBottle(id) {
         `<span class="hint">（${escapeHtml(b.quarantine.updated_at)}，可在“质检隔离”页解除）</span></p>`;
     }
     if (b.affected && b.quarantine_hits && b.quarantine_hits.length) {
-      html += `<p class="low">受隔离影响，不得用于新分装 / 混样。命中隔离原瓶：${hitsHtml(b.quarantine_hits)}</p>`;
+      html += `<p class="low">受隔离影响，不得用于新分装 / 混样（仍可登记处置）。命中隔离原瓶：${hitsHtml(b.quarantine_hits)}</p>`;
     }
     html += `<h4>来源谱系（向上追溯至原始瓶）</h4>${renderLineage(b.lineage)}
       <h4>原瓶贡献量（精确分数 mL；形成时总体积 ${b.contributions.formation_volume} mL）</h4>
@@ -463,6 +500,16 @@ async function showBottle(id) {
         `<li class="mono">${escapeHtml(o.op_id)}（${escapeHtml(o.op_time)}）取用 ${o.drawn_volume} mL → ${escapeHtml(o.target_bottle)}</li>`).join('') + '</ul>';
     }
     if (!b.operations.as_target.length && !b.operations.as_source.length) html += '<p>暂无相关操作。</p>';
+    if (b.disposals && b.disposals.length) {
+      html += '<h4>处置记录（只扣减该瓶余量，不影响来源谱系）</h4>' +
+        '<table><thead><tr><th>处置号</th><th>处置时间</th><th class="num">处置体积 (mL)</th><th>原因</th><th class="num">处置后余量 (mL)</th></tr></thead><tbody>';
+      for (const d of b.disposals) {
+        html += `<tr><td class="mono">${escapeHtml(d.disposal_id)}</td><td>${escapeHtml(d.disposal_time)}</td>` +
+          `<td class="num">${d.volume}</td><td>${escapeHtml(d.reason)}</td>` +
+          `<td class="num">${d.remaining_after === null ? '—' : d.remaining_after}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    }
     el.innerHTML = html;
     const expSetBtn = $('expSetBtn');
     if (expSetBtn) {
@@ -1215,6 +1262,64 @@ $('rsvSubmit').addEventListener('click', async () => {
     showMsg('err', e.message, e.details);
   } finally {
     $('rsvSubmit').disabled = false;
+  }
+});
+
+// ---------- 样本处置 ----------
+async function loadDisposals() {
+  const [rows, bottles] = await Promise.all([api('/api/disposals'), api('/api/bottles')]);
+  const tb = document.querySelector('#dspTable tbody');
+  tb.innerHTML = '';
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="7" class="hint">暂无处置记录。</td></tr>';
+  }
+  for (const d of rows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td class="mono">${escapeHtml(d.disposal_id)}</td>` +
+      `<td class="mono">${escapeHtml(d.bottle)}</td>` +
+      `<td>${escapeHtml(d.disposal_time)}</td>` +
+      `<td class="num">${d.volume}</td>` +
+      `<td>${escapeHtml(d.reason)}</td>` +
+      `<td class="num">${d.remaining_after === null || d.remaining_after === undefined ? '—' : d.remaining_after}</td>` +
+      `<td class="mono">${escapeHtml(d.created_at)}</td>`;
+    tb.appendChild(tr);
+  }
+  const bb = document.querySelector('#dspBalanceTable tbody');
+  bb.innerHTML = '';
+  for (const b of bottles) {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td class="mono">${escapeHtml(b.id)}</td>` +
+      `<td><span class="tag ${b.kind}">${b.kind === 'original' ? '原始瓶' : '衍生瓶'}</span></td>` +
+      `<td class="num ${b.remaining === 0 ? 'low' : ''}">${b.remaining}</td>` +
+      `<td class="num">${b.reserved > 0 ? b.reserved : '—'}</td>` +
+      `<td class="num ${b.reservable === 0 && b.remaining > 0 ? 'low' : ''}">${b.reservable}</td>` +
+      `<td class="num">${b.disposed > 0 ? b.disposed : '—'}</td>`;
+    bb.appendChild(tr);
+  }
+}
+
+$('dspSubmit').addEventListener('click', async () => {
+  clearMsg();
+  $('dspSubmit').disabled = true;
+  try {
+    const r = await api('/api/disposals', 'POST', {
+      disposal_id: $('dsp_id').value,
+      bottle: $('dsp_bottle').value,
+      disposal_time: $('dsp_time').value,
+      volume: $('dsp_vol').value,
+      reason: $('dsp_reason').value,
+    });
+    showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
+    if (!r.idempotent) {
+      $('dsp_id').value = ''; $('dsp_vol').value = ''; $('dsp_reason').value = '';
+    }
+    loadDisposals(); loadBottles();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('dspSubmit').disabled = false;
   }
 });
 

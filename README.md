@@ -3,7 +3,7 @@
 基于 **Node.js + Express + SQLite（better-sqlite3）** 的 Web 工作台，用于管理水质样本的
 原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯、
 历史操作更正与**更正预演 / 确认两阶段**、**原瓶质检隔离与影响范围拦截**、
-**形成证据封存与复核比较**、**预约锁定与核销**、**样本有效期管理**。
+**形成证据封存与复核比较**、**预约锁定与核销**、**样本有效期管理**、**剩余样本处置**。
 
 ## 一键启动（Docker Compose）
 
@@ -11,7 +11,7 @@
 docker compose up --build
 ```
 
-容器启动时会自动安装依赖、建表；数据库为空时写入示例数据（3 个原始瓶 + 2 条操作）。
+容器启动时会自动安装依赖、建表；数据库为空时写入示例数据（3 个原始瓶 + 2 条操作 + 1 笔处置）。
 
 浏览器访问：**http://localhost:3000**
 
@@ -63,6 +63,9 @@ npm start          # 访问 http://localhost:3000
   衍生瓶失效时间按全部来源瓶中最早者自动继承并随历史更正重算；总览实时标注
   “已失效 / 未失效”并可按状态筛选，失效瓶及其下游瓶不得用于新分装 / 混样、
   预约登记或预约核销。
+- **样本处置**：按唯一处置号、瓶号、处置时间、正整数毫升数和原因登记剩余样本处置；
+  处置流水与可用余量（当前余量 / 预约锁定 / 可处置量 / 已处置合计）实时展示，
+  瓶详情附该瓶处置记录（含每笔处置后余量）；已失效或受隔离影响的瓶仍可处置。
 
 ## 批次处理（本轮新增）
 
@@ -484,6 +487,79 @@ curl -s -X POST http://localhost:3000/api/operations -H 'Content-Type: applicati
 # 批次预演在对应条目给出同样错误（不签发凭据），批次提交重跑校验失败即整批回滚
 ```
 
+## 样本处置（本轮新增）
+
+实验室处理剩余样本时，操作员按 **唯一处置号 + 瓶号 + 处置时间 + 正整数毫升数 + 原因**
+登记处置；处置**只扣减该瓶余量，不生成新瓶，也不改动既有来源谱系**（形成图、原瓶贡献、
+失效继承、隔离影响范围均不受处置影响）；可查询处置流水及处置后余量。
+
+- **重放守恒**：处置作为纯扣量事件按（处置时间, 入库顺序）与全部既有操作一起重放
+  （处置与操作**共用同一入库序号空间**，同一时刻先入库者先核算）。处置时间不得早于瓶形成时间
+  （400 `TIME_BEFORE_FORMATION`）；若本次处置使后续任一取用超量（或自身在处置时刻可用量不足），
+  **整笔拒绝**并返回冲突操作和瓶（409 `DISPOSAL_OVERDRAW`，details 逐条给出
+  `op_id` / `disposal_id`、瓶、需取量、可用量），数据不变更。
+- **预约保护**：有效预约锁定量不得被处置占用——处置后该瓶余量须仍 ≥ 有效预约锁定量，
+  否则 409 `DISPOSAL_EXCEEDS_UNLOCKED`（可处置量 = 当前余量 − 有效预约锁定，与可预约量同口径）。
+- **隔离 / 失效不拦截**：已失效或受隔离影响的瓶仍可正常登记处置。
+- **幂等**：同号同内容（瓶 + 处置时间 + 体积 + 原因）重试 → 200 幂等返回，不重复扣量；
+  同号异内容 → 409 `DISPOSAL_CONFLICT`。
+- **全账联动**：现有单条操作、更正（立即 / 预演 / 确认）及批次提交的全账重放均计入处置扣量；
+  **历史更正若使任一处置或有效预约无法满足，整次更正回滚**（409 `CORRECTION_REJECTED` /
+  `RESERVATION_EXCEEDED`），更正预演在 `errors` / `disposal_conflicts` 中给出明细且不签发确认凭据；
+  批次预演把“批次取用导致既有处置无法满足”列为整批错误（不签发提交凭据），批次提交重跑校验失败即整批回滚。
+- **凭据失效**：处置提交使台账版本递增，**未使用的批次提交凭据与更正确认凭据随之失效**
+  （409 `STALE_TOKEN`，需重新预演）；已成功请求的幂等重试保持原结果。
+- **查询**：`GET /api/disposals` 处置流水（按处置时间排列，含每笔 `remaining_after` 处置后余量，
+  可按 `?bottle=` 过滤）；`GET /api/disposals/:id` 单笔详情；瓶子总览 / 瓶详情新增
+  `disposed`（已处置合计），瓶详情附 `disposals` 处置流水。
+
+### 调用示例
+
+```bash
+# 1) 登记处置：W2026-003 处置 120 mL → 201
+curl -s http://localhost:3000/api/disposals -H 'Content-Type: application/json' -d '{
+  "disposal_id": "DISP-0002",
+  "bottle": "W2026-003",
+  "disposal_time": "2026-10-05T09:00",
+  "volume": 120,
+  "reason": "检测完成，余样处置"}'
+# → {"ok":true,"idempotent":false,
+#    "disposal":{"disposal_id":"DISP-0002","bottle":"W2026-003",
+#      "disposal_time":"2026-10-05T09:00:00","volume":120,"reason":"检测完成，余样处置",
+#      "created_at":"…","remaining_after":330},
+#    "remaining":330,
+#    "message":"处置 DISP-0002 已登记：瓶 W2026-003 处置 120 mL……当前余量 330 mL；……"}
+#    同号同内容重试 → 200 {"idempotent":true, …}（不重复扣量）
+#    同号异内容 → 409 DISPOSAL_CONFLICT
+
+# 2) 查询处置流水及处置后余量（可按瓶过滤）
+curl -s http://localhost:3000/api/disposals
+curl -s "http://localhost:3000/api/disposals?bottle=W2026-003"
+curl -s http://localhost:3000/api/disposals/DISP-0002
+# → [{"disposal_id":"DISP-0001","bottle":"W2026-003","disposal_time":"2026-10-03T09:00:00",
+#     "volume":50,"reason":"留样期满，按规定处置","remaining_after":450, …}, …]
+
+# 3) 处置使后续取用超量 → 409 DISPOSAL_OVERDRAW（整笔拒绝，返回冲突操作和瓶）
+curl -s http://localhost:3000/api/disposals -H 'Content-Type: application/json' -d '{
+  "disposal_id": "DISP-0003", "bottle": "MIX-001",
+  "disposal_time": "2026-10-01T12:00", "volume": 300, "reason": "示例：将使后续取用超量"}'
+# → 409 {"error":{"code":"DISPOSAL_OVERDRAW","message":"本次处置使后续任一取用超量……",
+#        "details":[{"op_id":"OP-0002","bottle":"MIX-001","requested":100,"available":50}]}}
+
+# 4) 处置占用有效预约锁定量 → 409 DISPOSAL_EXCEEDS_UNLOCKED
+#    （瓶 W2026-001 余量 800、有效预约锁定 300、可处置 500，申请处置 600）
+# → 409 {"error":{"code":"DISPOSAL_EXCEEDS_UNLOCKED","message":"处置不得占用有效预约锁定量……",
+#        "details":[{"bottle":"W2026-001","requested":600,"unlocked":500,"remaining":800,"reserved":300}]}}
+
+# 5) 已失效 / 受隔离影响的瓶仍可处置 → 201（不做隔离 / 失效拦截）
+
+# 6) 处置时间早于瓶形成时间 → 400 TIME_BEFORE_FORMATION；瓶不存在 → 404 BOTTLE_NOT_FOUND
+```
+
+处置提交后，未使用的批次提交凭据与更正确认凭据失效（409 `STALE_TOKEN`），需重新预演；
+历史更正若使任一处置或有效预约无法满足，整次更正回滚（409 `CORRECTION_REJECTED` /
+`RESERVATION_EXCEEDED`），原数据保持不变。
+
 ## 业务规则与一致性设计
 
 - **唯一操作号 + 幂等**：`op_id` 为主键。同一操作号重复提交**相同内容**时幂等返回
@@ -533,12 +609,21 @@ curl -s -X POST http://localhost:3000/api/operations -H 'Content-Type: applicati
   批次逐条报错并整批回滚，批内前项失效沿链传播至后项）；历史操作、更正、证据封存与
   查询不受拦截。失效时间变动递增台账版本，凭据另绑定已失效瓶集合指纹（瓶到达失效时间
   即使无写操作也使未提交凭据失效）；幂等判定先于失效拦截，已成功请求的重试保持原结果。
+- **样本处置**：处置存于 `disposals` 表（处置号主键、内容哈希、与操作共用同一入库序号空间）。
+  处置作为纯扣量事件按（处置时间, 入库顺序）与全部操作一起重放：只扣减该瓶余量，
+  不生成新瓶、不改动来源谱系与形成图（原瓶贡献、失效继承、隔离影响范围均不受处置影响）；
+  处置时间不得早于瓶形成时间；重放后任一时刻余量为负（后续取用超量或处置自身无法满足）
+  即整笔回滚并返回冲突操作 / 处置与瓶；处置后该瓶余量须仍覆盖有效预约锁定量。
+  已失效或受隔离影响的瓶仍可处置。同号同内容幂等、异内容 409。单条操作、更正与批次提交的
+  全账重放均计入处置扣量；历史更正使任一处置或有效预约无法满足时整次回滚。
+  处置提交递增台账版本，未使用的批次提交 / 更正确认凭据随之失效。
 - **并发守恒**：better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
   并发争用同一来源瓶时不会出现超扣；已用并发压测验证（10 并发争用 400 mL，
   恰好 4 笔成功、余量归零不为负；5 并发重复提交同一操作号仅扣量一次；
   5 并发重复提交同一批次仅扣量一次，其余幂等返回；10 并发争用 400 mL 可预约量
   恰好 4 笔预约成功、锁定 400 不超额；5 并发重复登记同一预约号仅锁定一次，
-  其余幂等返回；5 并发携同一预约执行仅核销一次）。
+  其余幂等返回；5 并发携同一预约执行仅核销一次；5 并发重复提交同一处置号仅扣量一次，
+  其余幂等返回；10 并发争用 500 mL 可处置量恰好 5 笔处置成功、余量归零不为负）。
 - **明确报错**：编号冲突（409）、来源不存在（400）、操作时间早于来源创建时间（400）、
   体积非正整数（400）、超用（409）等均以 JSON `error.code / message / details` 返回，
   页面顶部同步展示。
@@ -562,8 +647,11 @@ curl -s -X POST http://localhost:3000/api/operations -H 'Content-Type: applicati
 | `GET`  | `/api/reservations` | **（新增）** 全部预约（状态实时判定：有效 / 已到期 / 已取消 / 已核销）；可按 `?bottle=` 过滤 |
 | `GET`  | `/api/reservations/:id` | **（新增）** 单个预约详情；不存在 404 `RESERVATION_NOT_FOUND` |
 | `POST` | `/api/reservations/:id/cancel` | **（新增）** 取消有效预约 → 200；重复取消 200 幂等；已核销 409 `RESERVATION_NOT_ACTIVE`；已到期 409 `RESERVATION_EXPIRED` |
-| `GET` | `/api/bottles` | 全部瓶及当前余量（含 `reserved` 预约锁定量 / `reservable` 可预约量 / `expires_at` 失效时间（衍生瓶继承）/ `expired` 是否已失效 / `quarantine` / `affected` / `quarantine_hits`） |
-| `GET` | `/api/bottles/:id` | 单瓶详情：余量、预约锁定与可预约量、有效预约 `active_reservations`、失效时间与状态、来源谱系、相关操作、原瓶精确贡献量 `contributions`、隔离状态与命中 |
+| `POST` | `/api/disposals` | **（新增）** 登记处置 `{disposal_id, bottle, disposal_time, volume, reason}` → 201；同号同内容 200 幂等；异内容 409 `DISPOSAL_CONFLICT`；时间早于瓶形成 400 `TIME_BEFORE_FORMATION`；使后续取用超量 409 `DISPOSAL_OVERDRAW`；占用有效预约锁定 409 `DISPOSAL_EXCEEDS_UNLOCKED`；失效 / 隔离瓶仍可处置；提交后旧批次及更正预演凭据失效 |
+| `GET`  | `/api/disposals` | **（新增）** 处置流水（按处置时间排列，含每笔 `remaining_after` 处置后余量）；可按 `?bottle=` 过滤 |
+| `GET`  | `/api/disposals/:id` | **（新增）** 单笔处置详情（含处置后余量）；不存在 404 `DISPOSAL_NOT_FOUND` |
+| `GET` | `/api/bottles` | 全部瓶及当前余量（含 `reserved` 预约锁定量 / `reservable` 可预约量（同为可处置量）/ `disposed` 已处置合计 / `expires_at` 失效时间（衍生瓶继承）/ `expired` 是否已失效 / `quarantine` / `affected` / `quarantine_hits`） |
+| `GET` | `/api/bottles/:id` | 单瓶详情：余量、预约锁定与可预约量、有效预约 `active_reservations`、已处置合计 `disposed` 与处置流水 `disposals`、失效时间与状态、来源谱系、相关操作、原瓶精确贡献量 `contributions`、隔离状态与命中 |
 | `PUT` | `/api/bottles/:id/quarantine` | **（新增）** 设置原瓶隔离 `{reason}`（非空；仅原瓶）→ 201 / 更新原因 200 / 相同原因 200 幂等；衍生瓶 400、瓶不存在 404 |
 | `DELETE` | `/api/bottles/:id/quarantine` | **（新增）** 解除原瓶隔离 → 200；未隔离 409 `NOT_QUARANTINED` |
 | `GET` | `/api/quarantines` | **（新增）** 当前全部隔离原瓶及原因、设置时间 |
@@ -583,6 +671,6 @@ curl -s -X POST http://localhost:3000/api/operations -H 'Content-Type: applicati
 ├── Dockerfile            # node:20，构建时安装依赖，启动时确保依赖并初始化数据
 ├── docker-compose.yml    # 一键启动，映射 3000 端口，named volume 持久化数据
 ├── package.json
-├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 原瓶隔离与影响范围拦截 + 证据封存与复核比较 + 预约锁定与核销 + 样本有效期管理
-└── public/index.html     # 单页工作台（总览（含可预约量与失效状态筛选）/ 登记（可选失效时间）/ 操作 / 批量预演提交 / 预约管理 / 记录与更正（预演+确认）/ 贡献量展示 / 质检隔离 / 证据封存 / 原瓶失效时间管理）
+├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 原瓶隔离与影响范围拦截 + 证据封存与复核比较 + 预约锁定与核销 + 样本有效期管理 + 样本处置
+└── public/index.html     # 单页工作台（总览（含可预约量与失效状态筛选）/ 登记（可选失效时间）/ 操作 / 批量预演提交 / 预约管理 / 样本处置 / 记录与更正（预演+确认）/ 贡献量展示 / 质检隔离 / 证据封存 / 原瓶失效时间管理）
 ```
